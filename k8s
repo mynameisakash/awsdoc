@@ -1,0 +1,442 @@
+#######################################################################
+#                              TOPICS
+#######################################################################
+# 1.  BUILD CLOUD9 FROM CLOUDSHELL
+# 2.  BUILD EKS CLUSTER FROM CLOUD9
+# 3.  BUILD A CONTAINER IMAGE
+# 4.  PUSH CONTAINER IMAGE TO ECR
+# 5.  DEPLOY FROM ECR TO K8S
+# 6.  CONTAINER ORCHESTRATION - balancing that which is desired against that which exists
+# 7.  K8S CLUSTERIP SERVICES - because pods need to talk to each other
+# 8.  K8S NODEPORT SERVICES - because workloads outside our cluster need to talk to pods
+# 9.  K8S LOADBALANCER SERVICES - because the world outside needs to talk to our cluster
+# 10. AWS LOAD BALANCER (INGRESS) CONTROLLER - because we have more than one type of load balancer
+# 11. HORIZONTAL POD AUTOSCALER - create more pods as necessary
+# 12. CLUSTER AUTOSCALER - create more nodes as necessary
+#######################################################################
+
+
+#####################################################################
+# BUILD CLOUD9 FROM CLOUDSHELL
+#####################################################################
+
+# Navigate to: https://us-west-2.console.aws.amazon.com/cloudshell?region=us-west-2
+
+# identify the AWS managed AdministratorAccess policy
+# NOTE cluster creators should ideally follow these instructions https://eksctl.io/usage/minimum-iam-policies/
+admin_policy_arn=$(aws iam list-policies --query "Policies[?PolicyName=='AdministratorAccess'].Arn" --output text)
+
+# create the Role-EC2-EKSClusterAdmin role, ensuring both the current user and EC2 instances are able to assume it
+cat > ./Role-EC2-EKSClusterAdmin.trust << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "$(aws sts get-caller-identity --query '[Arn]' --output text)",
+        "Service": "ec2.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+aws iam create-instance-profile --instance-profile-name Role-EC2-EKSClusterAdmin
+aws iam create-role --role-name Role-EC2-EKSClusterAdmin --assume-role-policy-document file://Role-EC2-EKSClusterAdmin.trust
+aws iam add-role-to-instance-profile --instance-profile-name Role-EC2-EKSClusterAdmin --role-name Role-EC2-EKSClusterAdmin
+aws iam attach-role-policy --role-name Role-EC2-EKSClusterAdmin --policy-arn ${admin_policy_arn}
+
+# create your cloud9 environment from the CloudShell session and associate new role with this instance
+env_id=$(aws cloud9 create-environment-ec2 --name dev --instance-type m5.large --automatic-stop-time-minutes 240 --query "environmentId" --output text)
+instance_id=$(aws ec2 describe-instances --filters "Name='tag:aws:cloud9:environment',Values='${env_id}'" --query "Reservations[].Instances[0].InstanceId" --output text)
+echo ${instance_id}                                            # if blank, wait a sec and repeat previous instruction
+aws ec2 associate-iam-instance-profile --instance-id ${instance_id} --iam-instance-profile Name=Role-EC2-EKSClusterAdmin
+
+# execute the following command then navigate your browser to the URL produced before exiting/closing your CloudShell session
+echo "https://${AWS_DEFAULT_REGION}.console.aws.amazon.com/cloud9/ide/${env_id}"
+
+##########################################################
+# BUILD EKS CLUSTER FROM CLOUD9
+##########################################################
+
+# install AWS CLI v2, eksctl, kubectl, AWS Session Manager plugin, jq, helm, tree and siege
+sudo mv /usr/local/bin/aws /usr/local/bin/aws.old
+sudo mv /usr/bin/aws /usr/bin/aws.old
+curl --silent "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+sudo mv /tmp/eksctl /usr/local/bin
+curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.17.0/bin/linux/amd64/kubectl
+chmod +x ./kubectl
+sudo mv ./kubectl /usr/local/bin/kubectl
+curl --silent "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm" -o "session-manager-plugin.rpm"
+sudo yum install -y session-manager-plugin.rpm jq tree siege
+curl -sSL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+rm -r ./aws/ ./awscliv2.zip session-manager-plugin.rpm
+# ... plus a custom script to simplify remote calls to the EKS worker nodes via SSM
+# TODO test if this is a suitable replacement -> https://github.com/mludvig/aws-ssm-tools
+cat > ./ssm-exec << EOF
+#!/bin/bash
+worker_node_instance_id=\$1
+command=\$2
+command_id=\$(aws ssm send-command --instance-ids \${worker_node_instance_id} --document-name "AWS-RunShellScript" --parameters commands="\${command}" --output text --query Command.CommandId)
+aws ssm wait command-executed --instance-id \${worker_node_instance_id} --command-id \${command_id}
+aws ssm list-command-invocations --instance-id \${worker_node_instance_id} --command-id \${command_id} --details --output text --query CommandInvocations[0].CommandPlugins[0].Output
+EOF
+chmod +x ./ssm-exec
+sudo mv ./ssm-exec /usr/local/bin/ssm-exec
+
+# verify this worked
+which aws eksctl kubectl session-manager-plugin jq tree helm siege ssm-exec
+
+# finally, install the kubectl neat add-on (https://krew.sigs.k8s.io/docs/user-guide/setup/install/ | https://github.com/itaysk/kubectl-neat)
+(
+  set -x; cd "$(mktemp -d)" &&
+  curl -fsSLO "https://github.com/kubernetes-sigs/krew/releases/latest/download/krew.tar.gz" &&
+  tar zxvf krew.tar.gz &&
+  KREW=./krew-"$(uname | tr '[:upper:]' '[:lower:]')_$(uname -m | sed -e 's/x86_64/amd64/' -e 's/arm.*$/arm/')" &&
+  "$KREW" install krew
+)
+echo 'export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+kubectl krew install neat
+
+# at this point, c9 is using "AWS managed temporary credentials" and we are NOT currently assuming the Role-EC2-EKSClusterAdmin
+c9_user_arn=$(aws sts get-caller-identity --query "Arn" --output text) # capture the user arn for later use
+echo $c9_user_arn                                              # verify we are using an IAM user - don't lose this value!
+
+############################ >>> <IMPORTANT MANUAL STEP> <<< #################################
+# go to c9 IDE Preferences -> AWS Settings -> switch OFF "AWS managed temporary credentials"
+############################ ^^^ <IMPORTANT MANUAL STEP> ^^^ #################################
+
+aws sts get-caller-identity                                    # verify we are now using the Role-EC2-EKSClusterAdmin IAM role
+
+# create EKS cluster with a managed node group and fargate profile (NOTE "eksctl create cluster" will also update ~/.kube/config)
+export AWS_DEFAULT_REGION=$(curl --silent http://169.254.169.254/latest/meta-data/placement/availability-zone | head -c-1)
+cat > ./dev-cluster-config.yaml << EOF
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: dev
+  region: ${AWS_DEFAULT_REGION}
+  version: "1.17"
+availabilityZones: ["${AWS_DEFAULT_REGION}a", "${AWS_DEFAULT_REGION}b", "${AWS_DEFAULT_REGION}c"]
+managedNodeGroups:
+  - name: ng-dev
+    availabilityZones: ["${AWS_DEFAULT_REGION}a", "${AWS_DEFAULT_REGION}b", "${AWS_DEFAULT_REGION}c"]
+    instanceType: t3.small
+    desiredCapacity: 2
+    maxSize: 6
+    ssh:
+      enableSsm: true
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+        appMesh: true
+        albIngress: true
+        xRay: true
+        cloudwatch: true
+fargateProfiles:
+  - name: fp-dev
+    selectors:
+      - namespace: serverless
+EOF
+
+eksctl create cluster -f ./dev-cluster-config.yaml
+
+# check the Cloud9 environment can connect to the k8s cluster and display the TWO worker nodes
+kubectl get nodes -o wide
+
+# (optional) add an IAM user to the system:masters group
+echo ${c9_user_arn}                                            # check variable is set with correct ARN for your IAM user, adjust if necessary
+user_yaml="  mapUsers: |\n    - userarn: ${c9_user_arn}\n      username: $(echo $c9_user_arn | rev | cut -d"/" -f1 | rev)\n      groups:\n      - system:masters"
+kubectl get configmap aws-auth -n kube-system -o yaml | awk "/data:/{print;print \"${user_yaml}\";next}1" > /tmp/aws-auth-patch.yml
+kubectl patch configmap aws-auth -n kube-system --patch "$(cat /tmp/aws-auth-patch.yml)"
+
+##########################################################
+# BUILD A CONTAINER IMAGE
+##########################################################
+
+# assume docker local install, keep it neat, kill everything!
+for i in $(docker ps -q); do docker kill $i; done
+docker system prune --all --force
+
+# set the app name and version which will be used throughout this walkthrough
+app_name=hello-web
+app_version=1.0.42
+
+# create PHP source in working directory (this is typically /home/ec2-user/environment)
+# NOTE the use of 169.254.169.254 is an indication that index.php is customized for EC2 instances
+cat > ./index.php << EOF
+<?php
+  \$x = 0.0001; for (\$i = 0; \$i <= 1000000; \$i++) { \$x += sqrt(\$x); } // simulate some work
+  \$ec2_instance = shell_exec('curl http://169.254.169.254/latest/meta-data/instance-id');
+  \$ec2_ip = shell_exec('curl http://169.254.169.254/latest/meta-data/local-ipv4');
+  \$localhost_ip = shell_exec('hostname -i | tr -d \'\n\'');
+  echo '{ "date": "' . date("c") . '", "version": "' . getenv("VERSION") . '", "ec2Instance": "' . \$ec2_instance . '", "ec2IP": "' . \$ec2_ip . '", "localhostIP": "' . \$localhost_ip . '" }' . "\n";
+?>
+EOF
+
+# open index.php in the c9 editor and satisfy yourself that your can run and preview this this app on port 8080 inside c9
+# NOTE at this point that the ec2IP is equivalent to the localhostIP
+
+# create Dockerfile alongside index.php
+cat > ./Dockerfile << EOF 
+FROM php:8.0.1-apache
+ENV VERSION=${app_version}
+COPY index.php /var/www/html/
+RUN chmod a+rx *.php
+EOF
+
+# build the docker image and run a container instance
+docker build -t ${app_name} .                                  # <--- don’t miss the dot at the end!
+docker images                                                  # see what you produced
+docker ps                                                      # nothing running ...
+container_id=$(docker run --detach --rm -p 8081:80 ${app_name}) # request docker to instantiate a single container as a background process
+docker ps                                                      # ... now one container running
+docker exec -it ${container_id} curl localhost:80              # shell INTO that container and curl the INTERNAL port (80)
+curl localhost:8081                                            # show that the corresponding EXTERNAL port is mapped to a high-order port (8081) on the c9 instance
+docker network inspect bridge | jq  .[0].IPAM.Config[0].Subnet # see why the ec2IP is no longer equivalent to the localhostIP
+docker stop ${container_id}                                    # stop the container (which will be terminated because we ran it with the --rm flag)
+
+##########################################################
+# PUSH CONTAINER IMAGE TO ECR
+##########################################################
+
+# create ECR repo
+repo_uri=$( \
+  aws ecr create-repository \
+    --repository-name ${app_name} \
+    --region ${AWS_DEFAULT_REGION} \
+    --image-scanning-configuration scanOnPush=true \
+    --query 'repository.repositoryUri' \
+    --output text \
+)
+
+# push image to ECR repository (click "View push commands" in console to see these instructions)
+echo ${app_name} ${app_version}                                # check the app name and version are set (we'll also use these later when we build the helm chart)
+aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${repo_uri}
+docker tag ${app_name}:latest ${repo_uri}:${app_version}
+docker images
+docker push ${repo_uri}:${app_version}                         # our EKS cluster can now locate this image by its tag
+
+##########################################################
+# DEPLOY FROM ECR TO K8S
+##########################################################
+
+# deploy our app to k8s and scale to 3 pods
+kubectl create deployment ${app_name} --image ${repo_uri}:${app_version}
+kubectl set resources deployment ${app_name} --requests=cpu=200m # set a reasonable resource allocation (for scaling)
+kubectl get deployments,pods -o wide                           # one deployment, one pod
+kubectl scale deployment ${app_name} --replicas 3
+kubectl get deployments,pods -o wide                           # one deployment, three pods
+
+# exec into pods to perform curl test
+kubectl exec -it $(kubectl get pods -l app=${app_name} -o name | head -1) -- curl localhost:80
+
+#####################################################################################
+# CONTAINER ORCHESTRATION - balancing that which is desired against that which exists
+#####################################################################################
+
+# grab the worker node instance ids into an indexed array
+worker_nodes=($( \
+  aws ec2 describe-instances \
+    --filters Name=instance-state-name,Values=running Name=tag-key,Values=eks:nodegroup-name Name=tag-value,Values=ng-dev \
+    --query Reservations[].Instances[].[InstanceId]  \
+    --output text \
+))
+
+# our ssm-exec script assists us in running remote shell commands without the need to open port 22
+# using ssm-exec and the docker CLI on each worker node, observe how our three pod instance replicas have been distributed across the two worker nodes
+ssm-exec ${worker_nodes[0]} "docker ps" | grep k8s_${app_name} # worker node one
+ssm-exec ${worker_nodes[1]} "docker ps" | grep k8s_${app_name} # worker node two
+
+kubectl get pods                                               # view the pods, paying attention to the number of RESTARTS
+# kill one hello-world container from directly within a worker node using docker CLI
+victim=($(ssm-exec ${worker_nodes[0]} "docker ps" | grep k8s_${app_name} | head -1))
+ssm-exec ${worker_nodes[0]} "docker kill ${victim[0]}"
+kubectl get pods                                               # view the pods again, RESTARTS have occurred but the number of running pods is unchanged
+
+# return to the worker nodes to observe that the victim was replaced
+ssm-exec ${worker_nodes[0]} "docker ps" | grep k8s_${app_name} # worker node one
+ssm-exec ${worker_nodes[1]} "docker ps" | grep k8s_${app_name} # worker node two
+
+##################################################################
+# K8S CLUSTERIP SERVICES - because pods need to talk to each other
+##################################################################
+
+# create a second deployment (nginx) for ClusterIP demo purposes
+# NOTE we are positioning nginx as the equivalent of jumpbox - we will use it to gain "private" access to our app
+kubectl create deployment nginx --image nginx
+kubectl get deployments,pods -o wide                           # two deployments, four pods
+kubectl exec -it $(kubectl get pods -l app=nginx -o name | head -1) -- curl localhost:80
+
+# introduce ClusterIP service (NOTE we remote into nginx here to demonstrate pod-to-pod communication)
+# this fails, because no such service exists yet ...
+kubectl exec -it $(kubectl get pods -l app=nginx -o name | head -1) curl ${app_name}:80                                        # <---- FAILURE
+kubectl get services                                           # our service should not currently exist so delete if present
+kubectl expose deployment ${app_name} --port=80 --type=ClusterIP
+kubectl get services
+
+# ... now pods can reach each other via services
+kubectl exec -it $(kubectl get pods -l app=nginx -o name | head -1) -- /bin/bash -c "while true; do curl ${app_name}:80; done" # <---- SUCCESS ctrl+c to quit loop
+
+####################################################################################
+# K8S NODEPORT SERVICES - because workloads outside our cluster need to talk to pods
+####################################################################################
+
+# upgrade to a NodePort service which also makes deployment accessible via ANY worker node
+kubectl delete service ${app_name}
+kubectl expose deployment ${app_name} --port=80 --type=NodePort # this will auto-assign a high-order port on ALL worker nodes
+# check the service
+kubectl get services
+# capture the node port for later use (this high-order port this will be in the 30000+ range)
+node_port=$(kubectl get service -l app=${app_name} -o jsonpath='{.items[0].spec.ports[0].nodePort}')
+
+# ... now worker nodes will distribute inbound requests to underlying pods
+# we curl from inside the worker node to avoid having to update security groups w.r.t the high-order node port
+# it will take about 5 seconds to complete - observe the ec2IP and localhostIP changing with each of the invocations
+ssm-exec ${worker_nodes[0]} "for i in \$(seq 20) ; do curl --silent localhost:${node_port} ; done"
+
+# but check the ec2Instance field ... these requests were sent to just one of the worker nodes, yet serviced by both of them? 
+# that's netfilter/iptables at work
+# when pods belonging to services are started/stopped, the k8s node-proxy agent on each worker node modifies its routes, creating a kernel-level load balancer per service
+
+####################################################################################
+# K8S LOADBALANCER SERVICES - because the world outside needs to talk to our cluster
+####################################################################################
+
+# upgrade to a LoadBalancer service which also supports external request distribution over an AWS ELB
+kubectl delete service ${app_name}
+kubectl expose deployment ${app_name} --port=80 --type=LoadBalancer # note this new service will automatically re-assign the high-order node port
+# check the service
+kubectl get service
+lb_dnsname=$(kubectl get service -l app=${app_name} -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+
+# ... now EXTERNAL port 80 requests are load balanced across the node ports of all worker nodes
+# NOTE we put this curl in a loop as the load balancer will not be immediately resolved (2-3 mins)
+while true; do curl http://${lb_dnsname}; done                 # ... now try this HTTP URL from a browser and ctrl+c to quit loop
+
+####################################################################################
+# AWS LOAD BALANCER (INGRESS) CONTROLLER - because we have more than one type of load balancer
+####################################################################################
+
+# we previously deployed a Classic Load Balancer which cannot implement the routing requirements to simultaneously front multiple deployments
+# for that, we need Application Load Balancers which EKS clusters do not support out of the box
+
+# to conserve AWS resources, downgrade our service from type LoadBalancer to NodePort
+kubectl delete service ${app_name}
+kubectl expose deployment ${app_name} --port=80 --type=NodePort
+
+# our AWS Load Balancer Controller (AKA Ingress Controller) needs to get its job done without neighbouring workloads violating the principle 
+# of least privilege (https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)
+eksctl utils associate-iam-oidc-provider --region ${AWS_DEFAULT_REGION} --cluster dev --approve
+aws iam create-policy \
+  --policy-name AWSLoadBalancerControllerIAMPolicy \
+  --policy-document file://<(curl --silent https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json)
+eksctl create iamserviceaccount \
+  --cluster dev \
+  --namespace kube-system \
+  --name aws-load-balancer-controller \
+  --attach-policy-arn $(aws iam list-policies --query "Policies[?PolicyName=='AWSLoadBalancerControllerIAMPolicy'].Arn" --output text) \
+  --override-existing-serviceaccounts \
+  --approve
+
+# we need to install dedicated resource definitions and the associated controller
+# which is trusted to deploy a limited set of AWS components, including ALBs
+kubectl apply -k https://github.com/aws/eks-charts/stable/aws-load-balancer-controller/crds
+helm repo add eks https://aws.github.io/eks-charts
+helm upgrade -i aws-load-balancer-controller \
+    eks/aws-load-balancer-controller \
+    -n kube-system \
+    --set clusterName=dev \
+    --set serviceAccount.create=false \
+    --set serviceAccount.name=aws-load-balancer-controller \
+    --set image.tag="v2.0.0"
+
+# now we can instantiate our Ingress object via a manifest as we might do with any standard k8s object
+cat > ./alb.yaml << EOF
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: ${app_name}
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /*
+            backend:
+              serviceName: ${app_name}
+              servicePort: 80
+EOF
+kubectl apply -f ./alb.yaml
+
+# test it out - no more Classic Load Balancers!
+lb_dnsname=$(kubectl get ingress ${app_name} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+while true; do curl http://${lb_dnsname}; done
+
+####################################################################################################################
+# HORIZONTAL POD AUTOSCALER - create more pods as necessary
+####################################################################################################################
+
+# see that metrics server is missing
+kubectl top nodes
+
+# install the metrics server (NOTE "latest" may not be appropriate)
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# see that metrics server is now ready
+kubectl describe deployment metrics-server -n kube-system
+kubectl top nodes                                              # this may take a minute to produce results
+kubectl top pods
+
+# activate the Horizontal Pod Autoscaler (hpa) for the first time
+kubectl autoscale deployment ${app_name} --cpu-percent=50 --min=3 --max=25
+
+# in a dedicated terminal window, keep watching the k8s objects
+watch "kubectl get nodes; echo; kubectl get deployments,hpa,pods -o wide"
+
+# in a dedicated terminal window, use siege to put the app under heavy load
+siege -c 200 ${lb_dnsname}                                     # simulate 4 concurrent users
+
+# NOTE this will cause the HPA to autoscale the pods to its max but many will remain in a "Pending" state
+# Leave SIEGE running ... the Cluster Autoscaler, up next, will address this
+
+####################################################################################################################
+# CLUSTER AUTOSCALER - create more nodes as necessary
+####################################################################################################################
+
+# dial back the HPA to leave some headroom for the CAS to deploy its pod
+kubectl patch hpa ${app_name} --patch '{"spec":{"maxReplicas":3}}'
+
+# the nodeGroup has ASG with maxSize of 6 so we've got some headroom, we just need to trigger it
+# create the cluster auto scaler (is it the latest for this EKS version?)
+kubectl apply -f <( \
+  curl --silent https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/cloudprovider/aws/examples/cluster-autoscaler-autodiscover.yaml | \
+    sed 's/<YOUR CLUSTER NAME>/dev/g' \
+)
+
+# revert the HPA - the cluster is still under siege so CAS will deploy more nodes to accomodate
+kubectl patch hpa ${app_name} --patch '{"spec":{"maxReplicas":25}}'
+
+# in a dedicated terminal window, tail the logs to witness the EC2 scaling
+kubectl logs deployment cluster-autoscaler -n kube-system -f
+
+# more nodes will be added and all 25 pods will now start
+# ctrl+c the running siege command and replace with something much less intense
+siege -c 1 ${lb_dnsname}                                       # simulate just 1 user to keep the metrics active
+
+# continue to watch as the HPA target drops and pods and nodes (slowly!) revert to their minimums
+
+#############
+# NEXT STEPS
+#############
+
+# https://bit.ly/amcginlay-helm3
+# https://gist.github.com/amcginlay/
